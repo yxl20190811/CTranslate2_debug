@@ -1,4 +1,5 @@
 #include "module.h"
+#include "storage_view.h"
 
 #include <sstream>
 
@@ -53,6 +54,7 @@ namespace ctranslate2 {
     }
 
     static StorageView create_view_from_array(py::object array) {
+        printf("\r\n[%d:%s]\r\n", __LINE__, __FILE__);
       auto device = Device::CPU;
 
       py::object interface_obj = py::getattr(array, "__array_interface__", py::none());
@@ -62,22 +64,28 @@ namespace ctranslate2 {
           throw std::invalid_argument("Object does not implement the array interface");
         device = Device::CUDA;
       }
-
+      printf("\r\n[%d:%s]\r\n", __LINE__, __FILE__);
       py::dict interface = interface_obj.cast<py::dict>();
       if (interface_obj.contains("strides") && !interface_obj["strides"].is_none())
         throw std::invalid_argument("StorageView does not support arrays with non contiguous memory");
-
+      printf("\r\n[%d:%s]\r\n", __LINE__, __FILE__);
       auto shape = interface["shape"].cast<Shape>();
+      printf("\r\n    shape = %u:", shape.size());
       auto dtype = typestr_to_dtype(interface["typestr"].cast<std::string>());
       auto data = interface["data"].cast<py::tuple>();
+      printf("\r\n[%d:%s]\r\n", __LINE__, __FILE__);
       auto ptr = data[0].cast<uintptr_t>();
+      printf("\r\n[%d:%s]\r\n", __LINE__, __FILE__);
       auto read_only = data[1].cast<bool>();
 
       if (read_only)
         throw std::invalid_argument("StorageView does not support read-only arrays");
 
       StorageView view(dtype, device);
+      printf("\r\n[%d:%s]\r\n", __LINE__, __FILE__);
+      printf("\r\n    shape = %u:", shape.size());
       view.view((void*)ptr, std::move(shape));
+      printf("\r\n[%d:%s]\r\n", __LINE__, __FILE__);
       return view;
     }
 
@@ -93,8 +101,43 @@ namespace ctranslate2 {
         "version"_a=3);
     }
 
+    StorageViewWrapper::StorageViewWrapper(StorageView view)
+      : _data_owner(py::none())
+      , _view(std::move(view))
+    {
+    }
+
+    StorageViewWrapper StorageViewWrapper::from_array(py::object array) {
+        printf("\r\n[%d:%s]\r\n", __LINE__, __FILE__);
+      StorageViewWrapper view = create_view_from_array(array);
+      printf("\r\n[%d:%s]\r\n", __LINE__, __FILE__);
+      view.set_data_owner(array);
+      printf("\r\n[%d:%s]\r\n", __LINE__, __FILE__);
+      return view;
+    }
+
+    py::dict StorageViewWrapper::array_interface() const {
+      if (_view.device() == Device::CUDA)
+        throw pybind11::attribute_error("Cannot get __array_interface__ when the StorageView "
+                                        "is viewing a CUDA array");
+      return get_array_interface(_view);
+    }
+
+    py::dict StorageViewWrapper::cuda_array_interface() const {
+      if (_view.device() == Device::CPU)
+        throw pybind11::attribute_error("Cannot get __cuda_array_interface__ when the StorageView "
+                                        "is viewing a CPU array");
+      return get_array_interface(_view);
+    }
+
+    std::string StorageViewWrapper::str() const {
+      std::ostringstream stream;
+      stream << _view;
+      return stream.str();
+    }
+
     void register_storage_view(py::module& m) {
-      py::class_<StorageView>(
+      py::class_<StorageViewWrapper>(
         m, "StorageView",
         R"pbdoc(
             An allocated buffer with shape information.
@@ -123,8 +166,7 @@ namespace ctranslate2 {
 
         )pbdoc")
 
-        .def_static("from_array", &create_view_from_array, py::arg("array"),
-                    py::keep_alive<0, 1>(),
+        .def_static("from_array", &StorageViewWrapper::from_array, py::arg("array"),
                     R"pbdoc(
                         Creates a ``StorageView`` from an object implementing the array interface.
 
@@ -140,26 +182,10 @@ namespace ctranslate2 {
                             uses an unsupported array specification.
                     )pbdoc")
 
-        .def_property_readonly("__array_interface__", [](const StorageView& view) {
-          if (view.device() == Device::CUDA)
-            throw py::attribute_error("Cannot get __array_interface__ when the StorageView "
-                                      "is viewing a CUDA array");
-          return get_array_interface(view);
-        })
+        .def_property_readonly("__array_interface__", &StorageViewWrapper::array_interface)
+        .def_property_readonly("__cuda_array_interface__", &StorageViewWrapper::cuda_array_interface)
 
-        .def_property_readonly("__cuda_array_interface__", [](const StorageView& view) {
-          if (view.device() == Device::CPU)
-            throw py::attribute_error("Cannot get __cuda_array_interface__ when the StorageView "
-                                      "is viewing a CPU array");
-          return get_array_interface(view);
-        })
-
-        .def("__str__", [](const StorageView& view) {
-          std::ostringstream stream;
-          stream << view;
-          return stream.str();
-        })
-
+        .def("__str__", &StorageViewWrapper::str)
         ;
     }
 
