@@ -74,55 +74,25 @@ namespace ctranslate2 {
       _is_multilingual = vocabulary.size() == 51865;
     }
 
-    StorageView WhisperReplica::encode(StorageView features, const bool to_cpu) {
-      PROFILE("WhisperReplica::encode");
-
-#ifdef CT2_WITH_CUDA
-      const cuda::UseTrueFp16GemmInScope use_true_fp16_gemm(false);
-#endif
-
-      const auto scoped_device_setter = _model->get_scoped_device_setter();
-      const Device device = _model->device();
-      const DataType dtype = _encoder->output_type();
-      features.move_to(device, dtype);
-
-      StorageView encoder_output(dtype, device);
-      (*_encoder)(features, encoder_output);
-
-      if (to_cpu) {
-        if (device != Device::CPU)
-          encoder_output = encoder_output.to(Device::CPU);
-        return encoder_output;
-      }
-
-      // Ensure all operations are finished before returning the output.
-      synchronize_stream(device);
-
-      return encoder_output;
-    }
-
-    StorageView WhisperReplica::maybe_encode(StorageView features) {
+    StorageView WhisperReplica::encode(const StorageView& features) {
       const Device device = _model->device();
       const DataType dtype = _encoder->output_type();
 
-      features.move_to(device, dtype);
-
-      // Already encoded.
-      if (features.dim(-1) == _encoder->output_size()
-          && features.dim(-2) == _encoder->output_time())
-        return features;
-
       StorageView encoder_output(dtype, device);
-      (*_encoder)(features, encoder_output);
+      if (features.device() == device && features.dtype() == dtype)
+        (*_encoder)(features, encoder_output);
+      else
+        (*_encoder)(features.to(device).to(dtype), encoder_output);
+
       return encoder_output;
     }
 
     std::vector<WhisperGenerationResult>
-    WhisperReplica::generate(StorageView features,
+    WhisperReplica::generate(const StorageView& features,
                              const std::vector<std::vector<std::string>>& prompts,
                              const WhisperOptions& options) {
       const auto& vocabulary = _model->get_vocabulary();
-      return generate(std::move(features), vocabulary.to_ids(prompts), options);
+      return generate(features, vocabulary.to_ids(prompts), options);
     }
 
     static std::vector<float> get_no_speech_probs_from_logits(const StorageView& logits,
@@ -229,7 +199,7 @@ namespace ctranslate2 {
     };
 
     std::vector<WhisperGenerationResult>
-    WhisperReplica::generate(StorageView features,
+    WhisperReplica::generate(const StorageView& features,
                              const std::vector<std::vector<size_t>>& prompts,
                              const WhisperOptions& options) {
       PROFILE("WhisperReplica::generate");
@@ -248,7 +218,7 @@ namespace ctranslate2 {
       const auto scoped_device_setter = _model->get_scoped_device_setter();
 
       layers::DecoderState state = _decoder->initial_state();
-      state.emplace("memory", maybe_encode(std::move(features)));
+      state.emplace("memory", encode(features));
 
       _decoder->update_output_layer(_model->preferred_size_multiple());
 
@@ -368,7 +338,7 @@ namespace ctranslate2 {
     }
 
     std::vector<WhisperAlignmentResult>
-    WhisperReplica::align(StorageView features,
+    WhisperReplica::align(const StorageView& features,
                           const std::vector<size_t>& start_sequence,
                           const std::vector<std::vector<size_t>>& text_tokens,
                           dim_t num_frames,
@@ -412,7 +382,7 @@ namespace ctranslate2 {
 #endif
 
       layers::DecoderState state = _decoder->initial_state(/*iterative_decoding=*/false);
-      state.emplace("memory", maybe_encode(std::move(features)));
+      state.emplace("memory", encode(features));
 
       _decoder->update_output_layer(_model->preferred_size_multiple());
 
@@ -500,7 +470,7 @@ namespace ctranslate2 {
     }
 
     std::vector<std::vector<std::pair<std::string, float>>>
-    WhisperReplica::detect_language(StorageView features) {
+    WhisperReplica::detect_language(const StorageView& features) {
       if (!is_multilingual())
         throw std::runtime_error("detect_language can only be called on multilingual models");
 
@@ -532,7 +502,7 @@ namespace ctranslate2 {
         score_ids = score_ids.to(device);
 
       layers::DecoderState state = _decoder->initial_state();
-      state.emplace("memory", maybe_encode(std::move(features)));
+      state.emplace("memory", encode(features));
 
       StorageView logits(_decoder->output_type(), device);
       StorageView lang_probs(logits.dtype(), device);
@@ -576,67 +546,68 @@ namespace ctranslate2 {
       return replica.is_multilingual();
     }
 
-    std::future<StorageView> Whisper::encode(const StorageView& features, const bool to_cpu) {
-      return post<StorageView>([features = features.sync_copy(), to_cpu](WhisperReplica& replica) {
-        return replica.encode(std::move(features), to_cpu);
-      });
-    }
-
     std::vector<std::future<WhisperGenerationResult>>
-    Whisper::generate(const StorageView& features,
+    Whisper::generate(StorageView features,
                       std::vector<std::vector<std::string>> prompts,
                       WhisperOptions options) {
       const size_t batch_size = features.dim(0);
       return post_batch<WhisperGenerationResult>(
-        [features = features.sync_copy(), prompts = std::move(prompts), options]
+        [features = std::move(features), prompts = std::move(prompts), options]
         (WhisperReplica& replica) {
-          return replica.generate(std::move(features), prompts, options);
+          return replica.generate(features, prompts, options);
         },
         batch_size);
     }
 
     std::vector<std::future<WhisperGenerationResult>>
-    Whisper::generate(const StorageView& features,
+    Whisper::generate(StorageView features,
                       std::vector<std::vector<size_t>> prompts,
                       WhisperOptions options) {
       const size_t batch_size = features.dim(0);
-      return post_batch<WhisperGenerationResult>(
-        [features = features.sync_copy(), prompts = std::move(prompts), options]
+      std::vector<std::future<WhisperGenerationResult>> ret =  post_batch<WhisperGenerationResult>(
+        [features = std::move(features), prompts = std::move(prompts), options]
         (WhisperReplica& replica) {
-          return replica.generate(std::move(features), prompts, options);
+          return replica.generate(features, prompts, options);
         },
         batch_size);
+      /*
+      ctranslate2::models::WhisperGenerationResult res = ret[0].get();
+      //std::cout << res.sequences[0][1] << std::endl;
+      std::string  tmp = res.sequences[0][1];
+      FILE* fp = fopen("C:\\Users\\86136\\source\\2.txt", "wb");
+      char buf[1000];
+      memcpy(buf, tmp.c_str(), tmp.length());
+      fwrite(buf, tmp.length(),1, fp);
+      fclose(fp);
+      */
+      return ret;
     }
 
     std::vector<std::future<std::vector<std::pair<std::string, float>>>>
-    Whisper::detect_language(const StorageView& features) {
+    Whisper::detect_language(StorageView features) {
       const size_t batch_size = features.dim(0);
       return post_batch<std::vector<std::pair<std::string, float>>>(
-        [features = features.sync_copy()](WhisperReplica& replica) {
-          return replica.detect_language(std::move(features));
+        [features = std::move(features)](WhisperReplica& replica) {
+          return replica.detect_language(features);
         },
         batch_size);
     }
 
     std::vector<std::future<WhisperAlignmentResult>>
-    Whisper::align(const StorageView& features,
+    Whisper::align(StorageView features,
                    std::vector<size_t> start_sequence,
                    std::vector<std::vector<size_t>> text_tokens,
                    dim_t num_frames,
                    dim_t median_filter_width) {
       const size_t batch_size = features.dim(0);
       return post_batch<WhisperAlignmentResult>(
-        [features = features.sync_copy(),
+        [features = std::move(features),
          start_sequence = std::move(start_sequence),
          text_tokens = std::move(text_tokens),
          num_frames,
          median_filter_width]
         (WhisperReplica& replica) {
-          return replica.align(std::move(features),
-                               start_sequence,
-                               text_tokens,
-                               num_frames,
-                               median_filter_width);
+          return replica.align(features, start_sequence, text_tokens, num_frames, median_filter_width);
         },
         batch_size);
     }
